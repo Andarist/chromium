@@ -7,7 +7,9 @@
 #include <limits>
 #include <utility>
 
+#include "base/functional/callback.h"
 #include "base/notimplemented.h"
+#include "base/run_loop.h"
 #include "components/viz/test/test_in_process_context_provider.h"
 #include "mojo/public/cpp/bindings/pending_receiver.h"
 #include "mojo/public/cpp/bindings/pending_remote.h"
@@ -22,6 +24,23 @@ constexpr uint32_t kDefaultClientId = std::numeric_limits<uint32_t>::max();
 
 TestImageTransportFactory::TestImageTransportFactory()
     : frame_sink_id_allocator_(kDefaultClientId) {
+  ConnectToViz();
+}
+
+TestImageTransportFactory::~TestImageTransportFactory() = default;
+
+void TestImageTransportFactory::SimulateGpuProcessRestart() {
+  base::RunLoop run_loop;
+  host_frame_sink_manager_.SetConnectionLostCallback(run_loop.QuitClosure());
+  test_frame_sink_manager_impl_.reset();
+  run_loop.Run();
+  host_frame_sink_manager_.SetConnectionLostCallback(base::RepeatingClosure());
+  ConnectToViz();
+}
+
+void TestImageTransportFactory::ConnectToViz() {
+  test_frame_sink_manager_impl_ =
+      std::make_unique<viz::TestFrameSinkManagerImpl>();
   mojo::PendingRemote<viz::mojom::FrameSinkManager> frame_sink_manager;
   mojo::PendingReceiver<viz::mojom::FrameSinkManager>
       frame_sink_manager_receiver =
@@ -40,12 +59,10 @@ TestImageTransportFactory::TestImageTransportFactory()
   // Bind endpoints in TestFrameSinkManagerImpl. For non-tests there would be
   // a FrameSinkManagerImpl running in another process and these interface
   // endpoints would be bound there.
-  test_frame_sink_manager_impl_.BindReceiver(
+  test_frame_sink_manager_impl_->BindReceiver(
       std::move(frame_sink_manager_receiver),
       std::move(frame_sink_manager_client));
 }
-
-TestImageTransportFactory::~TestImageTransportFactory() = default;
 
 void TestImageTransportFactory::CreateLayerTreeFrameSink(
     base::WeakPtr<ui::Compositor> compositor) {

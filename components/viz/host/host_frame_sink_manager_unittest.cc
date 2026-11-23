@@ -503,6 +503,48 @@ TEST_F(HostFrameSinkManagerTest, RestartOnGpuCrash) {
   EXPECT_TRUE(IsBoundToFrameSinkManager());
 }
 
+// A CompositorFrameSink created before the GPU process restarts doesn't exist
+// in the new one until it is created again.
+TEST_F(HostFrameSinkManagerTest, HasCreatedCompositorFrameSinkAfterGpuRestart) {
+  EXPECT_CALL(impl(), RegisterFrameSinkId(kFrameSinkChild1,
+                                          true /* report_activation */));
+  RegisterFrameSinkIdWithFakeClient(kFrameSinkChild1,
+                                    ReportFirstSurfaceActivation::kYes);
+  EXPECT_FALSE(host().HasCreatedCompositorFrameSink(kFrameSinkChild1));
+
+  MockCompositorFrameSinkClient compositor_frame_sink_client;
+  mojo::Remote<mojom::CompositorFrameSink> compositor_frame_sink;
+  EXPECT_CALL(impl(), CreateCompositorFrameSink(kFrameSinkChild1, _, _, _, _));
+  host().CreateCompositorFrameSink(
+      kFrameSinkChild1, compositor_frame_sink.BindNewPipeAndPassReceiver(),
+      compositor_frame_sink_client.BindInterfaceRemote());
+  FlushHostAndVerifyExpectations();
+  EXPECT_TRUE(host().HasCreatedCompositorFrameSink(kFrameSinkChild1));
+
+  KillGpu();
+  {
+    base::RunLoop run_loop;
+    host().SetConnectionLostCallback(run_loop.QuitClosure());
+    run_loop.Run();
+  }
+  EXPECT_FALSE(host().HasCreatedCompositorFrameSink(kFrameSinkChild1));
+
+  ConnectToGpu();
+  EXPECT_CALL(impl(), RegisterFrameSinkId(kFrameSinkChild1,
+                                          true /* report_activation */));
+  FlushHostAndVerifyExpectations();
+  EXPECT_FALSE(host().HasCreatedCompositorFrameSink(kFrameSinkChild1));
+
+  MockCompositorFrameSinkClient new_compositor_frame_sink_client;
+  mojo::Remote<mojom::CompositorFrameSink> new_compositor_frame_sink;
+  EXPECT_CALL(impl(), CreateCompositorFrameSink(kFrameSinkChild1, _, _, _, _));
+  host().CreateCompositorFrameSink(
+      kFrameSinkChild1, new_compositor_frame_sink.BindNewPipeAndPassReceiver(),
+      new_compositor_frame_sink_client.BindInterfaceRemote());
+  FlushHostAndVerifyExpectations();
+  EXPECT_TRUE(host().HasCreatedCompositorFrameSink(kFrameSinkChild1));
+}
+
 // Verify that HostFrameSinkManager does early return when trying to send
 // hit-test data after HitTestQuery was deleted.
 TEST_F(HostFrameSinkManagerTest, DeletedHitTestQuery) {

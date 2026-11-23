@@ -34,6 +34,7 @@
 #include "cc/trees/render_frame_metadata.h"
 #include "components/input/input_constants.h"
 #include "components/input/switches.h"
+#include "components/viz/common/frame_sinks/copy_output_result.h"
 #include "components/viz/common/surfaces/local_surface_id.h"
 #include "components/viz/common/surfaces/parent_local_surface_id_allocator.h"
 #include "components/viz/test/begin_frame_args_test.h"
@@ -78,6 +79,7 @@
 #include "mojo/public/cpp/bindings/pending_remote.h"
 #include "mojo/public/cpp/bindings/remote.h"
 #include "mojo/public/cpp/test_support/test_utils.h"
+#include "services/viz/public/mojom/compositing/compositor_frame_sink.mojom.h"
 #include "skia/ext/skia_utils_base.h"
 #include "testing/gmock/include/gmock/gmock.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -90,6 +92,7 @@
 #include "third_party/blink/public/mojom/drag/drag.mojom.h"
 #include "third_party/blink/public/mojom/input/input_handler.mojom-shared.h"
 #include "third_party/blink/public/mojom/input/touch_event.mojom.h"
+#include "third_party/skia/include/core/SkBitmap.h"
 #include "ui/base/clipboard/clipboard_constants.h"
 #include "ui/base/cursor/cursor.h"
 #include "ui/display/display_util.h"
@@ -289,7 +292,11 @@ class TestView : public TestRenderWidgetHostView {
       base::TimeDelta timeout,
       base::OnceCallback<void(const CopyFromSurfaceResult&)> callback)
       override {
+    last_copy_from_surface_timeout_ = timeout;
     copy_from_surface_callbacks_.push_back(std::move(callback));
+  }
+  base::TimeDelta last_copy_from_surface_timeout() const {
+    return last_copy_from_surface_timeout_;
   }
   std::vector<base::OnceCallback<void(const CopyFromSurfaceResult&)>>
   TakeCopyFromSurfaceCallbacks() {
@@ -311,6 +318,7 @@ class TestView : public TestRenderWidgetHostView {
   gfx::Insets insets_;
   std::vector<base::OnceCallback<void(const CopyFromSurfaceResult&)>>
       copy_from_surface_callbacks_;
+  base::TimeDelta last_copy_from_surface_timeout_;
 };
 
 // MockRenderViewHostDelegateView ------------------------------------------
@@ -514,6 +522,10 @@ class MockRenderWidgetHostDelegate : public RenderWidgetHostDelegate {
 
   bool IsFullscreen() override { return is_fullscreen_; }
 
+  base::UnguessableToken GetCompositorFrameSinkGroupingId() const override {
+    return compositor_frame_sink_grouping_id_;
+  }
+
   void set_is_fullscreen(bool enabled) { is_fullscreen_ = enabled; }
 
   TextInputManager* GetTextInputManager() override {
@@ -645,6 +657,9 @@ class MockRenderWidgetHostDelegate : public RenderWidgetHostDelegate {
       constrain_popup_bounds_callback_;
 
   VisibleTimeRequestTrigger visible_time_request_trigger_;
+
+  const base::UnguessableToken compositor_frame_sink_grouping_id_ =
+      base::UnguessableToken::Create();
 };
 
 class MockRenderWidgetHostOwnerDelegate
@@ -1690,6 +1705,166 @@ TEST_F(RenderWidgetHostTest, PendingSnapshotsFailWhenRendererExits) {
   ASSERT_TRUE(window_snapshot.has_value());
   EXPECT_TRUE(window_snapshot->IsEmpty());
 }
+
+#if defined(USE_AURA) || BUILDFLAG(IS_APPLE)
+// With kCDPScreenshotNewSurface, a surface snapshot's copy is sent without
+// waiting for a frame, so it fails if the GPU process has just died. Viz then
+// has no frame sink for the view until the renderer creates one again.
+class RenderWidgetHostSnapshotAfterGpuRestartTest
+    : public RenderWidgetHostTest {
+ protected:
+  void SetUp() override {
+    RenderWidgetHostTest::SetUp();
+    host_->SetViewIsFrameSinkIdOwner(true);
+  }
+
+  // Requests a frame sink for the view, as the renderer does.
+  void CreateFrameSink() {
+    mojo::PendingRemote<viz::mojom::CompositorFrameSink> frame_sink;
+    mojo::PendingReceiver<viz::mojom::CompositorFrameSinkClient> client;
+    host_->CreateFrameSink(frame_sink.InitWithNewPipeAndPassReceiver(),
+                           client.InitWithNewPipeAndPassRemote(),
+                           mojo::NullRemote());
+  }
+
+  void RestartGpuProcess() {
+    static_cast<TestImageTransportFactory*>(
+        ImageTransportFactory::GetInstance())
+        ->SimulateGpuProcessRestart();
+  }
+
+  // Requests a surface snapshot and fails the copy it sends.
+  void RequestSnapshotAndFailCopy() {
+    host_->GetSnapshotFromBrowser(
+        base::BindLambdaForTesting(
+            [&](const gfx::Image& image) { snapshot_ = image; }),
+        /*from_surface=*/true);
+    auto copy_callbacks = view_->TakeCopyFromSurfaceCallbacks();
+    ASSERT_EQ(1u, copy_callbacks.size());
+    std::move(copy_callbacks[0])
+        .Run(base::unexpected(CopyFromSurfaceError::kVizSentEmptyBitmap));
+  }
+
+  base::test::ScopedFeatureList feature_list_{
+      features::kCDPScreenshotNewSurface};
+  std::optional<gfx::Image> snapshot_;
+};
+
+// The failed copy is sent again once the renderer creates its frame sink in the
+// new GPU process, rather than retried while Viz has none.
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest, CopyWaitsForNewFrameSink) {
+  CreateFrameSink();
+  RestartGpuProcess();
+  RequestSnapshotAndFailCopy();
+  EXPECT_TRUE(view_->TakeCopyFromSurfaceCallbacks().empty());
+  EXPECT_FALSE(snapshot_.has_value());
+
+  CreateFrameSink();
+  auto copy_callbacks = view_->TakeCopyFromSurfaceCallbacks();
+  ASSERT_EQ(1u, copy_callbacks.size());
+  SkBitmap bitmap;
+  bitmap.allocN32Pixels(1, 1);
+  std::move(copy_callbacks[0]).Run(viz::CopyOutputBitmapWithMetadata(bitmap));
+  ASSERT_TRUE(snapshot_.has_value());
+  EXPECT_FALSE(snapshot_->IsEmpty());
+}
+
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest,
+       SnapshotFailsWithoutNewFrameSink) {
+  CreateFrameSink();
+  RestartGpuProcess();
+  RequestSnapshotAndFailCopy();
+  task_environment_.FastForwardBy(base::Seconds(5) - base::Milliseconds(1));
+  EXPECT_FALSE(snapshot_.has_value());
+  task_environment_.FastForwardBy(base::Milliseconds(1));
+  ASSERT_TRUE(snapshot_.has_value());
+  EXPECT_TRUE(snapshot_->IsEmpty());
+}
+
+// The GPU process can die while the last retry is in flight, after earlier
+// copies failed for another reason. The snapshot still waits for the new frame
+// sink.
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest,
+       LastRetryWaitsForNewFrameSink) {
+  CreateFrameSink();
+  RequestSnapshotAndFailCopy();
+  for (int i = 0; i < 4; ++i) {
+    auto copy_callbacks = view_->TakeCopyFromSurfaceCallbacks();
+    ASSERT_EQ(1u, copy_callbacks.size());
+    std::move(copy_callbacks[0])
+        .Run(base::unexpected(CopyFromSurfaceError::kVizSentEmptyBitmap));
+  }
+  auto last_retry = view_->TakeCopyFromSurfaceCallbacks();
+  ASSERT_EQ(1u, last_retry.size());
+
+  RestartGpuProcess();
+  std::move(last_retry[0])
+      .Run(base::unexpected(CopyFromSurfaceError::kVizSentEmptyBitmap));
+  EXPECT_FALSE(snapshot_.has_value());
+
+  CreateFrameSink();
+  auto copy_callbacks = view_->TakeCopyFromSurfaceCallbacks();
+  ASSERT_EQ(1u, copy_callbacks.size());
+  SkBitmap bitmap;
+  bitmap.allocN32Pixels(1, 1);
+  std::move(copy_callbacks[0]).Run(viz::CopyOutputBitmapWithMetadata(bitmap));
+  ASSERT_TRUE(snapshot_.has_value());
+  EXPECT_FALSE(snapshot_->IsEmpty());
+}
+
+// The resent copy waits in Viz for a frame, which the renderer may never draw,
+// so the snapshot keeps its deadline.
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest, ResentCopyKeepsDeadline) {
+  CreateFrameSink();
+  RestartGpuProcess();
+  RequestSnapshotAndFailCopy();
+  task_environment_.FastForwardBy(base::Seconds(2));
+  CreateFrameSink();
+  auto copy_callbacks = view_->TakeCopyFromSurfaceCallbacks();
+  ASSERT_EQ(1u, copy_callbacks.size());
+  EXPECT_EQ(base::Seconds(3), view_->last_copy_from_surface_timeout());
+
+  task_environment_.FastForwardBy(base::Seconds(3));
+  ASSERT_TRUE(snapshot_.has_value());
+  EXPECT_TRUE(snapshot_->IsEmpty());
+
+  // A result after the deadline is not retried.
+  std::move(copy_callbacks[0])
+      .Run(base::unexpected(CopyFromSurfaceError::kTimeout));
+  EXPECT_TRUE(view_->TakeCopyFromSurfaceCallbacks().empty());
+}
+
+// A new view's frame sink can't serve the old view's snapshot, so the snapshot
+// fails. That happens from a task, as the old view may be mid-teardown.
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest,
+       ViewChangeFailsWaitingSnapshot) {
+  CreateFrameSink();
+  RestartGpuProcess();
+  RequestSnapshotAndFailCopy();
+  TestView new_view(host_.get());
+  host_->SetView(&new_view);
+  EXPECT_FALSE(snapshot_.has_value());
+  ASSERT_TRUE(base::test::RunUntil([&] { return snapshot_.has_value(); }));
+  EXPECT_TRUE(snapshot_->IsEmpty());
+
+  CreateFrameSink();
+  EXPECT_TRUE(new_view.TakeCopyFromSurfaceCallbacks().empty());
+  host_->SetView(view_.get());
+}
+
+// A copy that fails for another reason is retried right away, as before: while
+// Viz has the frame sink, or before the renderer requested one.
+TEST_F(RenderWidgetHostSnapshotAfterGpuRestartTest,
+       CopyRetriedWithoutLostFrameSink) {
+  RequestSnapshotAndFailCopy();
+  EXPECT_EQ(1u, view_->TakeCopyFromSurfaceCallbacks().size());
+
+  snapshot_.reset();
+  CreateFrameSink();
+  RequestSnapshotAndFailCopy();
+  EXPECT_EQ(1u, view_->TakeCopyFromSurfaceCallbacks().size());
+}
+#endif  // defined(USE_AURA) || BUILDFLAG(IS_APPLE)
 
 TEST_F(RenderWidgetHostTest, ReceiveFrameTokenFromDeletedRenderWidget) {
   // The RenderWidget sends a monotonically increasing frame token.

@@ -5,6 +5,8 @@
 #ifndef CONTENT_PUBLIC_TEST_TEST_IMAGE_TRANSPORT_FACTORY_H_
 #define CONTENT_PUBLIC_TEST_TEST_IMAGE_TRANSPORT_FACTORY_H_
 
+#include <memory>
+
 #include "build/build_config.h"
 #include "cc/test/fake_layer_tree_frame_sink.h"
 #include "cc/test/test_task_graph_runner.h"
@@ -32,6 +34,10 @@ class TestImageTransportFactory : public ui::ContextFactory,
 
   ~TestImageTransportFactory() override;
 
+  // Drops the connection to Viz and, once HostFrameSinkManager has seen it
+  // lost, connects again, as when the GPU process restarts.
+  void SimulateGpuProcessRestart();
+
   // ui::ContextFactory implementation.
   void CreateLayerTreeFrameSink(
       base::WeakPtr<ui::Compositor> compositor) override;
@@ -48,12 +54,14 @@ class TestImageTransportFactory : public ui::ContextFactory,
   ui::ContextFactory* GetContextFactory() override;
 
  private:
+  void ConnectToViz();
+
   cc::TestTaskGraphRunner task_graph_runner_;
   viz::RendererSettings renderer_settings_;
   viz::FrameSinkIdAllocator frame_sink_id_allocator_;
   viz::SubtreeCaptureIdAllocator subtree_capture_id_allocator_;
   viz::HostFrameSinkManager host_frame_sink_manager_;
-  viz::TestFrameSinkManagerImpl test_frame_sink_manager_impl_;
+  std::unique_ptr<viz::TestFrameSinkManagerImpl> test_frame_sink_manager_impl_;
 };
 
 }  // namespace content
